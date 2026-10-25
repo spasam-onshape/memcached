@@ -66,6 +66,12 @@ static const char * _load_helper(lua_State *L, void *data, size_t *size) {
 
 void proxy_start_reload(void *arg) {
     proxy_ctx_t *ctx = arg;
+    // Record the request first: if the config thread is busy (mid-reload,
+    // running crons, or the manager thread holds the lock) the trylock below
+    // fails, and the config thread picks the request up once it is free.
+    // Previously a SIGHUP arriving during a reload was silently dropped,
+    // leaving the proxy on a stale configuration.
+    __atomic_store_n(&ctx->reload_pending, 1, __ATOMIC_SEQ_CST);
     if (pthread_mutex_trylock(&ctx->config_lock) == 0) {
         ctx->loading = true;
         pthread_cond_signal(&ctx->config_cond);
@@ -376,13 +382,24 @@ static void *_proxy_config_thread(void *arg) {
     while (1) {
         ctx->loading = false;
 
-        // cron only thinks in whole seconds.
-        wait.tv_sec = ctx->cron_next;
-        pthread_cond_timedwait(&ctx->config_cond, &ctx->config_lock, &wait);
+        if (!__atomic_load_n(&ctx->reload_pending, __ATOMIC_SEQ_CST)) {
+            // cron only thinks in whole seconds.
+            // Wake at least once a second: a reload request that raced with
+            // us holding the lock could not signal the condition.
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            wait.tv_sec = ctx->cron_next;
+            if (wait.tv_sec > now.tv_sec + 1) {
+                wait.tv_sec = now.tv_sec + 1;
+            }
+            pthread_cond_timedwait(&ctx->config_cond, &ctx->config_lock, &wait);
+        }
 
         proxy_run_crons(ctx);
 
-        if (ctx->loading) {
+        // Clear the pending flag before reloading so a request that arrives
+        // during this reload causes another one.
+        if (__atomic_exchange_n(&ctx->reload_pending, 0, __ATOMIC_SEQ_CST) || ctx->loading) {
             proxy_config_reload(ctx);
         }
     }
