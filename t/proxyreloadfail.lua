@@ -2,6 +2,9 @@
 local mode = dofile("/tmp/proxyreloadfail.lua")
 
 function mcp_config_pools(old)
+    if mode == "pools_error" then
+        error("mcp_config_pools failed on purpose")
+    end
     return {}
 end
 
