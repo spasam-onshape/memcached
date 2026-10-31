@@ -214,6 +214,7 @@ typedef struct {
     bool worker_failed; // covered by worker_lock as well.
     bool use_uring; // use IO_URING for backend connections.
     bool loading; // bool indicating an active config load.
+    int reload_pending; // reload requested; atomic, never lost if busy.
     bool memprofile; // indicate if we want to profile lua memory.
     uint8_t memprofile_thread_counter;
 } proxy_ctx_t;
@@ -302,6 +303,7 @@ struct mcp_backend_label_s {
     char name[MAX_NAMELEN+1];
     char port[MAX_PORTLEN+1];
     char label[MAX_LABELLEN+1];
+    char hashkey[MAX_LABELLEN+1]; // optional node identity for key distributors.
     size_t llen; // cache label length for small speedup in pool creation.
     int conncount; // number of sockets to make.
     bool use_logging;
@@ -677,6 +679,7 @@ void mcp_run_rcontext_handle(mcp_rcontext_t *rctx, int handle);
 void mcp_process_rctx_wait(mcp_rcontext_t *rctx, int handle);
 int mcp_process_rqueue_return(mcp_rcontext_t *rctx, int handle, mcp_resp_t *res);
 int mcplib_rcontext_handle_set_cb(lua_State *L);
+int mcplib_rcontext_handle_reset(lua_State *L);
 int mcplib_rcontext_enqueue(lua_State *L);
 int mcplib_rcontext_wait_cond(lua_State *L);
 int mcplib_rcontext_wait_handle(lua_State *L);

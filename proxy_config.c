@@ -66,6 +66,12 @@ static const char * _load_helper(lua_State *L, void *data, size_t *size) {
 
 void proxy_start_reload(void *arg) {
     proxy_ctx_t *ctx = arg;
+    // Record the request first: if the config thread is busy (mid-reload,
+    // running crons, or the manager thread holds the lock) the trylock below
+    // fails, and the config thread picks the request up once it is free.
+    // Previously a SIGHUP arriving during a reload was silently dropped,
+    // leaving the proxy on a stale configuration.
+    __atomic_store_n(&ctx->reload_pending, 1, __ATOMIC_SEQ_CST);
     if (pthread_mutex_trylock(&ctx->config_lock) == 0) {
         ctx->loading = true;
         pthread_cond_signal(&ctx->config_cond);
@@ -241,6 +247,7 @@ static void proxy_config_reload(proxy_ctx_t *ctx) {
         // Failed to load. log and wait for a retry.
         STAT_INCR(ctx, config_reload_fails, 1);
         LOGGER_LOG(NULL, LOG_PROXYEVENTS, LOGGER_PROXY_CONFIG, NULL, "failed");
+        lua_settop(L, 0); // drop the error; crons expect an empty stack.
         return;
     }
 
@@ -269,6 +276,7 @@ static void proxy_config_reload(proxy_ctx_t *ctx) {
         if (ctx->worker_failed) {
             STAT_INCR(ctx, config_reload_fails, 1);
             LOGGER_LOG(NULL, LOG_PROXYEVENTS, LOGGER_PROXY_CONFIG, NULL, "failed");
+            lua_settop(L, 0); // drop config_pools return value.
             return;
         }
     }
@@ -301,6 +309,7 @@ static void proxy_run_crons(proxy_ctx_t *ctx) {
         ctx->cron_next = INT_MAX;
     } else {
         // no crons ready.
+        lua_pop(L, 1); // drop cron table.
         return;
     }
 
@@ -373,13 +382,24 @@ static void *_proxy_config_thread(void *arg) {
     while (1) {
         ctx->loading = false;
 
-        // cron only thinks in whole seconds.
-        wait.tv_sec = ctx->cron_next;
-        pthread_cond_timedwait(&ctx->config_cond, &ctx->config_lock, &wait);
+        if (!__atomic_load_n(&ctx->reload_pending, __ATOMIC_SEQ_CST)) {
+            // cron only thinks in whole seconds.
+            // Wake at least once a second: a reload request that raced with
+            // us holding the lock could not signal the condition.
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            wait.tv_sec = ctx->cron_next;
+            if (wait.tv_sec > now.tv_sec + 1) {
+                wait.tv_sec = now.tv_sec + 1;
+            }
+            pthread_cond_timedwait(&ctx->config_cond, &ctx->config_lock, &wait);
+        }
 
         proxy_run_crons(ctx);
 
-        if (ctx->loading) {
+        // Clear the pending flag before reloading so a request that arrives
+        // during this reload causes another one.
+        if (__atomic_exchange_n(&ctx->reload_pending, 0, __ATOMIC_SEQ_CST) || ctx->loading) {
             proxy_config_reload(ctx);
         }
     }
@@ -491,8 +511,10 @@ static int proxy_load_files(proxy_ctx_t *ctx) {
         // now we complete the data load by calling the function.
         res = _run_pcall(L, 0, LUA_MULTRET);
         if (res != LUA_OK) {
+            // A failed reload keeps the running config; the first load fails
+            // startup via proxy_first_confload().
             fprintf(stderr, "ERROR: Failed to load data into lua config state: %s\n", lua_tostring(L, -1));
-            exit(EXIT_FAILURE);
+            return -1;
         }
 
         db = db->next;
@@ -515,18 +537,24 @@ int proxy_load_config(void *arg) {
 
     // load each of the data files in order.
     res = proxy_load_files(ctx);
+    if (res != 0) {
+        return res;
+    }
 
     // call the mcp_config_pools function to get the central backends.
     lua_getglobal(L, "mcp_config_pools");
 
     if (lua_isnil(L, -1)) {
         fprintf(stderr, "ERROR: Configuration file missing 'mcp_config_pools' function\n");
-        exit(EXIT_FAILURE);
+        return -1;
     }
     lua_pushnil(L); // no "old" config yet.
+    // Errors here are usually in the user's config file (syntax error, bad
+    // backend, unresolvable host). Previously this exited the whole process
+    // on a SIGHUP reload; now the reload fails and the old config stays.
     if (_run_pcall(L, 1, 1) != LUA_OK) {
         fprintf(stderr, "ERROR: Failed to execute mcp_config_pools: %s\n", lua_tostring(L, -1));
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     // result is our main config.

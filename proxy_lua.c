@@ -236,6 +236,18 @@ static int mcplib_time_mono_millis(lua_State *L) {
     return 1;
 }
 
+// Requests active on this worker thread, including background
+// (route_allasync) sub-requests that outlive the client response. Lets a
+// route apply back-pressure before queued requests use unbounded memory.
+static int mcplib_active_requests(lua_State *L) {
+    LIBEVENT_THREAD *t = PROXY_GET_THR(L);
+    WSTAT_L(t);
+    lua_Integer active = t->stats.proxy_req_active;
+    WSTAT_UL(t);
+    lua_pushinteger(L, active);
+    return 1;
+}
+
 // end util funcs.
 
 // NOTE: backends are global objects owned by pool objects.
@@ -396,6 +408,20 @@ static int mcplib_backend(lua_State *L) {
 
         if (lua_getfield(L, 1, "tcpkeepalive") != LUA_TNIL) {
             be->tunables.tcp_keepalive = lua_toboolean(L, -1);
+        }
+        lua_pop(L, 1);
+
+        // optional identity string handed to key distributors (ie; the exact
+        // ketama node string a client library hashes) instead of host:port.
+        if (lua_getfield(L, 1, "hashkey") != LUA_TNIL) {
+            size_t hklen = 0;
+            const char *hk = luaL_checklstring(L, -1, &hklen);
+            if (hklen == 0 || hklen > MAX_LABELLEN-1) {
+                proxy_lua_error(L, "backend hashkey must be between 1 and 511 characters");
+                return 0;
+            }
+            memcpy(be->hashkey, hk, hklen);
+            be->hashkey[hklen] = '\0';
         }
         lua_pop(L, 1);
 
@@ -785,6 +811,14 @@ static void _mcplib_pool_dist(lua_State *L, mcp_pool_t *p) {
         lua_setfield(L, -2, "addr");
         lua_pushstring(L, be->port);
         lua_setfield(L, -2, "port");
+        // the backend label objects are still in the table at index 1.
+        lua_geti(L, 1, x);
+        mcp_backend_label_t *bel = luaL_checkudata(L, -1, "mcp.backend");
+        if (bel->hashkey[0] != '\0') {
+            lua_pushstring(L, bel->hashkey);
+            lua_setfield(L, -3, "hashkey");
+        }
+        lua_pop(L, 1);
 
         // set the backend table into the new pool table.
         lua_rawseti(L, -2, x);
@@ -1797,6 +1831,7 @@ int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state) {
 
     const struct luaL_Reg mcplib_rcontext_m[] = {
         {"handle_set_cb", mcplib_rcontext_handle_set_cb},
+        {"handle_reset", mcplib_rcontext_handle_reset},
         {"enqueue", mcplib_rcontext_enqueue},
         {"wait_cond", mcplib_rcontext_wait_cond},
         {"enqueue_and_wait", mcplib_rcontext_enqueue_and_wait},
@@ -1880,6 +1915,7 @@ int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state) {
         {"res_mutator_new", mcplib_res_mutator_new},
         {"time_real_millis", mcplib_time_real_millis},
         {"time_mono_millis", mcplib_time_mono_millis},
+        {"active_requests", mcplib_active_requests},
         {NULL, NULL}
     };
     // VM's have void* extra space in the VM by default for fast-access to a

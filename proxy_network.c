@@ -1087,7 +1087,6 @@ static int _flush_pending_tls_write(struct mcp_backendconn_s *be) {
 static void proxy_bevalidate_tls_handler(const int fd, const short which, void *arg) {
     assert(arg != NULL);
     struct mcp_backendconn_s *be = arg;
-    int flags = EV_TIMEOUT;
     struct timeval tmp_time = be->tunables.read;
 
     if (which & EV_TIMEOUT) {
@@ -1141,12 +1140,15 @@ static void proxy_bevalidate_tls_handler(const int fd, const short which, void *
         }
 
         // Passed validation, don't need to re-read, flush any pending writes.
+        // A partial flush (more than TLS_WBUF_SIZE queued while connecting/validating) clears can_write and asks for
+        // EV_WRITE; without the write event nothing ever flushes this connection again and every later request on
+        // it is deferred forever.
         int res = _flush_pending_tls_write(be);
         if (res == -1) {
             _reset_bad_backend(be, P_BE_FAIL_WRITING);
             return;
         }
-        if (flags & EV_WRITE) {
+        if (res & EV_WRITE) {
             _start_write_event(be);
         }
         if (be->pending_read) {
